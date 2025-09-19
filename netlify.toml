@@ -1,0 +1,13 @@
+[build]
+  command = "npm ci"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+  included_files = ["app.js", "package.json"]
+
+# (Optional) local dev: route root to a simple index.html
+[[redirects]]
+  from = "/"
+  to = "/index.html"
+  status = 200
