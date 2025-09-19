@@ -4,33 +4,52 @@ const MAX_VIOLATIONS = 100;
 
 /* ------------ helpers ------------- */
 
-async function readTextFileFromRepo(octokit, { owner, repo, ref, path }) {
+// Get commit -> tree -> blob, then return exact text for a given path
+async function getBlobText(octokit, { owner, repo, commitSha, path }) {
+  // 1) commit -> tree sha
+  const commit = await octokit.repos.getCommit({ owner, repo, ref: commitSha });
+  const treeSha = commit.data.commit.tree.sha;
+
+  // 2) walk tree to find the blob sha for this path
+  const { data } = await octokit.git.getTree({
+    owner, repo, tree_sha: treeSha, recursive: "1",
+  });
+
+  const match = (data.tree || []).find(
+    (n) => n.type === "blob" && n.path === path
+  );
+  if (!match) return null;
+
+  // 3) fetch blob bytes (base64)
+  const blob = await octokit.git.getBlob({ owner, repo, file_sha: match.sha });
+  const b64 = blob.data.content; // base64
+  return Buffer.from(b64, "base64").toString("utf8");
+}
+
+// Safer JSON parse with last-resort trim if transport injected garbage
+function parseJSONSafe(raw, ctx, label = "json") {
   try {
-    const res = await octokit.repos.getContent({ owner, repo, path, ref });
-    if (Array.isArray(res.data)) return null; // directory
-    if (res.data.encoding === "base64" && res.data.content) {
-      return Buffer.from(res.data.content, "base64").toString("utf8");
+    return JSON.parse(raw);
+  } catch (e) {
+    // try trimming to last closing brace
+    const i = raw.lastIndexOf("}");
+    if (i > 0) {
+      const trimmed = raw.slice(0, i + 1);
+      try {
+        return JSON.parse(trimmed);
+      } catch {}
     }
-    if (res.data.download_url) {
-      const r = await fetch(res.data.download_url);
-      if (r.ok) return await r.text();
-    }
-    return null;
-  } catch {
+    ctx?.log?.warn(`day0: failed parsing ${label}: ${e.message}`);
     return null;
   }
 }
 
 async function findLockfiles(octokit, { owner, repo, commitSha }) {
-  // 1) Resolve the commit → tree SHA (this was the bug)
   const commit = await octokit.repos.getCommit({ owner, repo, ref: commitSha });
   const treeSha = commit.data.commit.tree.sha;
-
-  // 2) Walk the tree (recursive) to find lockfiles anywhere
   const { data } = await octokit.git.getTree({
     owner, repo, tree_sha: treeSha, recursive: "1",
   });
-
   const out = [];
   for (const item of data.tree || []) {
     if (item.type !== "blob") continue;
@@ -48,11 +67,11 @@ function collectFromNpmLockV1(lock, deps) {
       if (info?.dependencies) walk(info.dependencies);
     }
   }
-  walk(lock.dependencies || {});
+  walk(lock?.dependencies || {});
 }
 
 function collectFromNpmLockV2Plus(lock, deps) {
-  const packages = lock.packages || {};
+  const packages = lock?.packages || {};
   for (const [p, info] of Object.entries(packages)) {
     if (!info?.version) continue;
     const name = p === "" ? lock.name : p.replace(/^node_modules\//, "");
@@ -101,7 +120,6 @@ export default (app) => {
 
     ctx.log.info("day0:event", { action: ctx.payload.action, sha });
 
-    // Start check
     const check = await ctx.octokit.checks.create({
       owner: login, repo,
       name: "Day-0 Dependency Guard",
@@ -111,22 +129,20 @@ export default (app) => {
     const deps = new Set();
 
     try {
-      // Prefer exact file at repo root first (your case)
+      // Try common root files first (fast path for your Vite app)
       for (const rootPath of ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"]) {
-        const raw = await readTextFileFromRepo(ctx.octokit, { owner: login, repo, ref: sha, path: rootPath });
+        const raw = await getBlobText(ctx.octokit, { owner: login, repo, commitSha: sha, path: rootPath });
         if (!raw) continue;
 
         if (rootPath === "package-lock.json") {
-          try {
-            const lock = JSON.parse(raw);
+          const lock = parseJSONSafe(raw, ctx, rootPath);
+          if (lock) {
             if (lock.lockfileVersion && lock.lockfileVersion >= 2) {
               collectFromNpmLockV2Plus(lock, deps);
             } else {
               collectFromNpmLockV1(lock, deps);
             }
             ctx.log.info(`day0: parsed ${rootPath}, deps=${deps.size}`);
-          } catch (e) {
-            ctx.log.warn(`day0: failed parsing ${rootPath}: ${e.message}`);
           }
         } else if (rootPath === "pnpm-lock.yaml") {
           collectFromPnpmLock(raw, deps);
@@ -137,28 +153,27 @@ export default (app) => {
         }
       }
 
-      // If nothing yet, scan the tree (monorepo support, or non-root file)
+      // If still nothing, scan the whole tree (monorepo support)
       if (!deps.size) {
         const lockfiles = await findLockfiles(ctx.octokit, { owner: login, repo, commitSha: sha });
         ctx.log.info(`day0: found lockfiles ${JSON.stringify(lockfiles)}`);
 
         for (const lf of lockfiles) {
-          const raw = await readTextFileFromRepo(ctx.octokit, { owner: login, repo, ref: sha, path: lf });
+          const raw = await getBlobText(ctx.octokit, { owner: login, repo, commitSha: sha, path: lf });
           if (!raw) {
             ctx.log.warn(`day0: could not read ${lf}`);
             continue;
           }
+
           if (lf.endsWith("package-lock.json")) {
-            try {
-              const lock = JSON.parse(raw);
+            const lock = parseJSONSafe(raw, ctx, lf);
+            if (lock) {
               if (lock.lockfileVersion && lock.lockfileVersion >= 2) {
                 collectFromNpmLockV2Plus(lock, deps);
               } else {
                 collectFromNpmLockV1(lock, deps);
               }
               ctx.log.info(`day0: parsed ${lf}, deps=${deps.size}`);
-            } catch (e) {
-              ctx.log.warn(`day0: failed parsing ${lf}: ${e.message}`);
             }
           } else if (lf.endsWith("pnpm-lock.yaml")) {
             collectFromPnpmLock(raw, deps);
@@ -167,6 +182,7 @@ export default (app) => {
             collectFromYarnLock(raw, deps);
             ctx.log.info(`day0: parsed ${lf}, deps=${deps.size}`);
           }
+
           if (deps.size > 5000) break; // safety cap
         }
       }
